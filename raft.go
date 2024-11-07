@@ -96,6 +96,8 @@ type Raft struct {
 
 	muVote    sync.Mutex
 	voteCount int
+
+	applyCh chan ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -196,10 +198,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	if args.Term > rf.currentTerm {
 		rf.votedFor = -1
+		rf.currentTerm = args.Term
+		rf.role = Follower
 	}
 
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
-		if args.Term > rf.currentTerm || (args.LastLogIndex >= len(rf.log)-1 && args.LastLogTerm >= rf.log[len(rf.log)-1].Term) {
+		if args.LastLogTerm > rf.log[len(rf.log)-1].Term || (args.LastLogTerm == rf.log[len(rf.log)-1].Term && args.LastLogIndex >= len(rf.log)-1) {
 			rf.currentTerm = args.Term
 			reply.Term = rf.currentTerm
 			rf.votedFor = args.CandidateId
@@ -338,9 +342,13 @@ func (rf *Raft) ticker() {
 	}
 }
 
-func (rf *Raft) PPrint(msg string) {
-	//DPrintf("%s - raft %v:{currentTerm=%v, role=%v, votedFor=%v, vote=%v}\n", msg, rf.me, rf.currentTerm,
-	//	rf.role, rf.votedFor, rf.voteCount)
+func (rf *Raft) PPrint(msg string, a ...interface{}) {
+	if len(a) != 0 {
+		msg = fmt.Sprintf(msg, a...)
+	}
+	DPrintf("%s - raft %v:{currentTerm=%v, role=%v, votedFor=%v, vote=%v}\n", msg, rf.me, rf.currentTerm,
+		rf.role, rf.votedFor, rf.voteCount)
+
 }
 
 func (rf *Raft) Elect() {

@@ -30,15 +30,6 @@ import (
 	"6.824/labrpc"
 )
 
-// as each Raft peer becomes aware that successive log entries are
-// committed, the peer should send an ApplyMsg to the service (or
-// tester) on the same server, via the applyCh passed to Make(). set
-// CommandValid to true to indicate that the ApplyMsg contains a newly
-// committed log entry.
-//
-// in part 2D you'll want to send other kinds of messages (e.g.,
-// snapshots) on the applyCh, but set CommandValid to false for these
-// other uses.
 type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
@@ -51,6 +42,12 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+// entry
+type Entry struct {
+	Term int
+	Cmd  interface{}
+}
+
 // role enum
 const (
 	Follower = iota
@@ -58,11 +55,8 @@ const (
 	Leader
 )
 
-// entry
-type Entry struct {
-	Term int
-	Cmd  interface{}
-}
+const TickInterval int = 250
+const HeartBeatTimeOut int = 100
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
@@ -82,10 +76,6 @@ type Raft struct {
 	votedFor    int
 	log         []Entry
 
-	// volatile state on all servers
-	commitIndex int
-	lastApplied int
-
 	// volatile state on leaders
 	nextIndex  []int
 	matchIndex []int
@@ -97,6 +87,10 @@ type Raft struct {
 	muVote    sync.Mutex
 	voteCount int
 
+	// volatile state on all servers
+	commitIndex int
+	lastApplied int
+
 	applyCh chan ApplyMsg
 }
 
@@ -104,13 +98,8 @@ type Raft struct {
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
-
-	term := rf.currentTerm
-	role := rf.role
-
-	rf.mu.Unlock()
-	// Your code here (2A).
-	return term, role == Leader
+	defer rf.mu.Unlock()
+	return rf.currentTerm, rf.role == Leader
 }
 
 // save Raft's persistent state to stable storage,
@@ -165,6 +154,222 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
+func (rf *Raft) Kill() {
+	atomic.StoreInt32(&rf.dead, 1)
+	// Your code here, if desired.
+}
+
+func (rf *Raft) killed() bool {
+	z := atomic.LoadInt32(&rf.dead) // is this necessary?
+	return z == 1
+}
+
+func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.role != Leader {
+		return -1, -1, false
+	}
+	newEntry := &Entry{Term: rf.currentTerm, Cmd: command}
+	rf.log = append(rf.log, *newEntry)
+	// Your code here (2B).
+
+	return len(rf.log) - 1, rf.currentTerm, true
+}
+
+func (rf *Raft) CommitChecker() {
+	for !rf.killed() {
+		rf.mu.Lock()
+		for rf.commitIndex > rf.lastApplied {
+			rf.lastApplied += 1
+			msg := &ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log[rf.lastApplied].Cmd,
+				CommandIndex: rf.lastApplied,
+			}
+			rf.applyCh <- *msg
+			DPrintf("server %v 准备将命令 %v(索引为 %v ) 应用到状态机", rf.me, msg.Command, msg.CommandIndex)
+		}
+		rf.mu.Unlock()
+		time.Sleep(time.Duration(TickInterval) * time.Millisecond)
+	}
+}
+
+// append entries rpc
+type AppendEntriesArgs struct {
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []Entry
+	LeaderCommit int
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+func (rf *Raft) sendAppendEntries(serverTo int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[serverTo].Call("Raft.AppendEntries", args, reply)
+
+	return ok
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		rf.mu.Unlock()
+		reply.Success = false
+		return
+	}
+
+	rf.timestamp = time.Now()
+
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+		rf.role = Follower
+	}
+
+	if len(args.Entries) == 0 {
+		rf.PPrint(fmt.Sprintf("server %v 接收到 leader &%v 的心跳 - args %+v", rf.me, args.LeaderId, args))
+	} else {
+		rf.PPrint("server %v 收到 leader %v 的的AppendEntries: %+v ", rf.me, args.LeaderId, args)
+	}
+
+	if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Term = rf.currentTerm
+		rf.mu.Unlock()
+		reply.Success = false
+		rf.PPrint("server %v 检查到心跳中参数不合法:\t args.PrevLogIndex=%v, args.PrevLogTerm=%v, \tlen(self.log)=%v, self最后一个位置term为:%v", rf.me, args.PrevLogIndex, args.PrevLogTerm, len(rf.log), rf.log[len(rf.log)-1].Term)
+		return
+	}
+
+	if len(args.Entries) != 0 && len(rf.log) > args.PrevLogIndex+1 && rf.log[args.PrevLogIndex+1].Term != args.Entries[0].Term {
+		rf.PPrint("server %v 的log与args发生冲突, 进行移除", rf.me)
+		rf.log = rf.log[:args.PrevLogIndex+1]
+	}
+
+	rf.log = append(rf.log, args.Entries...)
+	if len(args.Entries) != 0 {
+		DPrintf("server %v 成功进行apeend", rf.me)
+		rf.SPrint()
+	}
+
+	reply.Success = true
+	reply.Term = rf.currentTerm
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = int(math.Min(float64(args.LeaderCommit), float64(len(rf.log)-1)))
+	}
+	rf.mu.Unlock()
+
+}
+
+func (rf *Raft) handleAppendEntries(serverTo int, args *AppendEntriesArgs) {
+	reply := &AppendEntriesReply{}
+	ok := rf.sendAppendEntries(serverTo, args, reply)
+	if !ok {
+		return
+	}
+	rf.mu.Lock()
+
+	if args.Term != rf.currentTerm {
+		rf.mu.Unlock()
+		return
+	}
+
+	if reply.Success {
+
+		rf.matchIndex[serverTo] = args.PrevLogIndex + len(args.Entries)
+		rf.nextIndex[serverTo] = rf.nextIndex[serverTo] + 1
+
+		N := len(rf.log) - 1
+		for N > rf.commitIndex {
+			count := 1
+			for i := 0; i < len(rf.peers); i++ {
+				if i == rf.me {
+					continue
+				}
+				if rf.matchIndex[i] >= N && rf.log[N].Term == rf.currentTerm {
+					count++
+				}
+			}
+			if count > len(rf.peers)/2 {
+				rf.commitIndex = N
+				break
+			}
+			N -= 1
+		}
+		rf.mu.Unlock()
+		return
+	}
+
+	if reply.Term > rf.currentTerm {
+		rf.PPrint(fmt.Sprintf("server %v 旧的leader收到了心跳函数中更新的term: %v, 转化为Follower ", rf.me, reply.Term))
+		rf.currentTerm = reply.Term
+		rf.votedFor = -1
+		rf.role = Follower
+		rf.timestamp = time.Now()
+		rf.mu.Unlock()
+		return
+	}
+
+	if reply.Term == rf.currentTerm && rf.role == Leader {
+		rf.nextIndex[serverTo]--
+		rf.mu.Unlock()
+		return
+	}
+}
+
+func (rf *Raft) SendHeartBeats() {
+	rf.PPrint(fmt.Sprintf("server %v 开始发送心跳 ", rf.me))
+
+	for !rf.killed() {
+		rf.mu.Lock()
+		if rf.role != Leader {
+			rf.mu.Unlock()
+			return
+		}
+
+		for i := 0; i < len(rf.peers); i++ {
+			if i == rf.me {
+				continue
+			}
+
+			if rf.nextIndex[i] > len(rf.log) {
+				rf.nextIndex[i] = len(rf.log)
+			}
+
+			rf.PPrint("CUURENT LOG: %v, next index - %v, i %v", rf.log, rf.nextIndex, i)
+			args := &AppendEntriesArgs{
+				Term:         rf.currentTerm,
+				LeaderId:     rf.me,
+				PrevLogIndex: rf.nextIndex[i] - 1,
+				PrevLogTerm:  rf.log[rf.nextIndex[i]-1].Term,
+				LeaderCommit: rf.commitIndex,
+			}
+			rf.PPrint("len of log -1 %v", len(rf.log)-1)
+			rf.PPrint("next index %v", rf.nextIndex[i])
+			if len(rf.log)-1 >= rf.nextIndex[i] {
+				args.Entries = rf.log[rf.nextIndex[i]:]
+				DPrintf("leader %v 开始向 server %v 广播新的AppendEntries, args = %+v", rf.me, i, args)
+			} else {
+				args.Entries = make([]Entry, 0)
+				DPrintf("leader %v 开始向 server %v 广播新的心跳, args = %+v  ", rf.me, i, args)
+			}
+
+			go rf.handleAppendEntries(i, args)
+
+		}
+		rf.mu.Unlock()
+
+		time.Sleep(time.Duration(HeartBeatTimeOut) * time.Millisecond)
+	}
+}
+
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 type RequestVoteArgs struct {
@@ -183,6 +388,11 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
+func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return ok
+}
+
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
@@ -192,7 +402,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Term = rf.currentTerm
 		rf.mu.Unlock()
 		reply.VoteGranted = false
-		rf.PPrint(fmt.Sprintf("server %v 拒绝向 server %v投票: 旧的term: %v,\n\targs= %+v\n", rf.me, args.CandidateId, args.Term, args))
+		rf.PPrint(fmt.Sprintf("server %v 拒绝向 server %v投票: 旧的term: %v,\targs= %+v", rf.me, args.CandidateId, args.Term, args))
 		return
 	}
 
@@ -212,10 +422,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 			rf.mu.Unlock()
 			reply.VoteGranted = true
-			rf.PPrint(fmt.Sprintf("server %v 同意向 server %v投票\n\targs= %+v\n", rf.me, args.CandidateId, args))
+			rf.PPrint(fmt.Sprintf("server %v 同意向 server %v投票 \targs= %+v ", rf.me, args.CandidateId, args))
 			return
 		} else {
-			rf.PPrint(fmt.Sprintf("server %v 拒绝向 server %v投票: 已投票\n\targs= %+v\n", rf.me, args.CandidateId, args))
+			rf.PPrint(fmt.Sprintf("server %v 拒绝向 server %v投票: 已投票 \targs= %+v ", rf.me, args.CandidateId, args))
 		}
 	}
 
@@ -225,112 +435,21 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 }
 
-// append entries rpc
-type AppendEntriesArgs struct {
-	Term         int
-	LeaderId     int
-	PrevLogIndex int
-	PrevLogTerm  int
-	Entries      []Entry
-	LeaderCommit int
-}
-
-type AppendEntriesReply struct {
-	Term    int
-	Success bool
-}
-
-// example code to send a RequestVote RPC to a server.
-// server is the index of the target server in rf.peers[].
-// expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should
-// pass &reply.
-// the types of the args and reply passed to Call() must be
-// the same as the types of the arguments declared in the
-// handler function (including whether they are pointers).
-//
-// The labrpc package simulates a lossy network, in which servers
-// may be unreachable, and in which requests and replies may be lost.
-// Call() sends a request and waits for a reply. If a reply arrives
-// within a timeout interval, Call() returns true; otherwise
-// Call() returns false. Thus Call() may not return for a while.
-// A false return can be caused by a dead server, a live server that
-// can't be reached, a lost request, or a lost reply.
-//
-// Call() is guaranteed to return (perhaps after a delay) *except* if the
-// handler function on the server side does not return.  Thus there
-// is no need to implement your own timeouts around Call().
-//
-// look at the comments in ../labrpc/labrpc.go for more details.
-//
-// if you're having trouble getting RPC to work, check that you've
-// capitalized all field names in structs passed over RPC, and
-// that the caller passes the address of the reply struct with &, not
-// the struct itself.
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
-}
-
-// the service using Raft (e.g. a k/v server) wants to start
-// agreement on the next command to be appended to Raft's log. if this
-// server isn't the leader, returns false. otherwise start the
-// agreement and return immediately. there is no guarantee that this
-// command will ever be committed to the Raft log, since the leader
-// may fail or lose an election. even if the Raft instance has been killed,
-// this function should return gracefully.
-//
-// the first return value is the index that the command will appear at
-// if it's ever committed. the second return value is the current
-// term. the third return value is true if this server believes it is
-// the leader.
-func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
-	// Your code here (2B).
-
-	return index, term, isLeader
-}
-
-// the tester doesn't halt goroutines created by Raft after each test,
-// but it does call the Kill() method. your code can use killed() to
-// check whether Kill() has been called. the use of atomic avoids the
-// need for a lock.
-//
-// the issue is that long-running goroutines use memory and may chew
-// up CPU time, perhaps causing later tests to fail and generating
-// confusing debug output. any goroutine with a long-running loop
-// should call killed() to check whether it should stop.
-func (rf *Raft) Kill() {
-	atomic.StoreInt32(&rf.dead, 1)
-	// Your code here, if desired.
-}
-
-func (rf *Raft) killed() bool {
-	z := atomic.LoadInt32(&rf.dead) // is this necessary?
-	return z == 1
-}
-
 func GetRandomElectTimeOut(rd *rand.Rand) int {
 	minT := 150
 	maxT := 350
 	return rd.Intn(maxT-minT+1) + minT
 }
 
-const TickInterval int = 100
-const HeartBeatTimeOut int = 50
-
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
 func (rf *Raft) ticker() {
 	rd := rand.New(rand.NewSource(int64(rf.me)))
-	for rf.killed() == false {
+	for !rf.killed() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
-		rf.PPrint("ping")
+		//rf.PPrint("ping")
 		rdTimeOut := GetRandomElectTimeOut(rd)
 		rf.mu.Lock()
 		if rf.role != Leader && time.Since(rf.timestamp) > time.Duration(rdTimeOut)*time.Millisecond {
@@ -346,9 +465,15 @@ func (rf *Raft) PPrint(msg string, a ...interface{}) {
 	if len(a) != 0 {
 		msg = fmt.Sprintf(msg, a...)
 	}
-	DPrintf("%s - raft %v:{currentTerm=%v, role=%v, votedFor=%v, vote=%v}\n", msg, rf.me, rf.currentTerm,
+	DPrintf("%s - raft %v:{currentTerm=%v, role=%v, votedFor=%v, vote=%v} ", msg, rf.me, rf.currentTerm,
 		rf.role, rf.votedFor, rf.voteCount)
 
+}
+
+func (rf *Raft) SPrint() {
+	DPrintf("raft %v:{currentTerm=%v, role=%v, votedFor=%v, voteCount=%v, log=%v, nextIndex=%v,"+
+		" matchIndex=%v, commitIndex=%v, lastApplied=%v} ", rf.me, rf.currentTerm,
+		rf.role, rf.votedFor, rf.voteCount, rf.log, rf.nextIndex, rf.matchIndex, rf.commitIndex, rf.lastApplied)
 }
 
 func (rf *Raft) Elect() {
@@ -378,6 +503,7 @@ func (rf *Raft) Elect() {
 }
 
 func (rf *Raft) collectVote(serverTo int, args *RequestVoteArgs) {
+	rf.PPrint("collecting votes")
 	voteAnswer := rf.GetVoteAnswer(serverTo, args)
 	if !voteAnswer {
 		return
@@ -398,6 +524,11 @@ func (rf *Raft) collectVote(serverTo int, args *RequestVoteArgs) {
 		}
 
 		rf.role = Leader
+		rf.PPrint("becomes leader")
+		for i := 0; i < len(rf.peers); i++ {
+			rf.nextIndex[i] = len(rf.log)
+			rf.matchIndex[i] = 0
+		}
 		rf.mu.Unlock()
 		go rf.SendHeartBeats()
 	}
@@ -428,102 +559,6 @@ func (rf *Raft) GetVoteAnswer(serverTo int, args *RequestVoteArgs) bool {
 	return reply.VoteGranted
 }
 
-func (rf *Raft) SendHeartBeats() {
-	rf.PPrint(fmt.Sprintf("server %v 开始发送心跳\n", rf.me))
-
-	for !rf.killed() {
-		rf.mu.Lock()
-		if rf.role != Leader {
-			rf.mu.Unlock()
-			return
-		}
-
-		args := &AppendEntriesArgs{
-			Term:         rf.currentTerm,
-			LeaderId:     rf.me,
-			PrevLogIndex: 0,
-			PrevLogTerm:  0,
-			Entries:      nil,
-			LeaderCommit: rf.commitIndex,
-		}
-		rf.mu.Unlock()
-
-		for i := 0; i < len(rf.peers); i++ {
-			if i == rf.me {
-				continue
-			}
-			go rf.handleHeartBeat(i, args)
-
-		}
-		time.Sleep(time.Duration(HeartBeatTimeOut) * time.Millisecond)
-	}
-}
-
-func (rf *Raft) handleHeartBeat(serverTo int, args *AppendEntriesArgs) {
-	reply := &AppendEntriesReply{}
-	sendArgs := *args
-	ok := rf.sendAppendEntries(serverTo, &sendArgs, reply)
-	if !ok {
-		return
-	}
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	if sendArgs.Term != rf.currentTerm {
-		return
-	}
-
-	if reply.Term > rf.currentTerm {
-		rf.PPrint(fmt.Sprintf("server %v 旧的leader收到了心跳函数中更新的term: %v, 转化为Follower\n", rf.me, reply.Term))
-		rf.currentTerm = reply.Term
-		rf.votedFor = -1
-		rf.role = Follower
-	}
-}
-
-func (rf *Raft) sendAppendEntries(serverTo int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	ok := rf.peers[serverTo].Call("Raft.AppendEntries", args, reply)
-
-	return ok
-}
-
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.mu.Lock()
-
-	if args.Term < rf.currentTerm {
-		reply.Term = rf.currentTerm
-		rf.mu.Unlock()
-		reply.Success = false
-		return
-	}
-
-	rf.timestamp = time.Now()
-
-	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-		rf.votedFor = -1
-		rf.role = Follower
-	}
-
-	if args.Entries == nil {
-		rf.PPrint(fmt.Sprintf("server %v 接收到 leader &%v 的心跳\n", rf.me, args.LeaderId))
-	}
-
-	if args.Entries != nil && (args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm) {
-		reply.Term = rf.currentTerm
-		rf.mu.Unlock()
-		reply.Success = false
-		return
-	}
-
-	reply.Success = true
-	reply.Term = rf.currentTerm
-	if args.LeaderCommit > rf.commitIndex {
-		rf.commitIndex = int(math.Min(float64(args.LeaderCommit), float64(len(rf.log)-1)))
-	}
-	rf.mu.Unlock()
-
-}
-
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -548,13 +583,18 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = make([]int, len(rf.peers))
 	rf.timestamp = time.Now()
 	rf.role = Follower
+	rf.applyCh = applyCh
 
+	for i := 1; i < len(rf.peers); i++ {
+		rf.nextIndex[i] = 1
+	}
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
+	go rf.CommitChecker()
 	rf.PPrint("Making raft ")
 	return rf
 }

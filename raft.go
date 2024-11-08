@@ -55,8 +55,8 @@ const (
 	Leader
 )
 
-const TickInterval int = 250
-const HeartBeatTimeOut int = 100
+const TickInterval int = 100
+const HeartBeatTimeOut int = 50
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
@@ -284,7 +284,7 @@ func (rf *Raft) handleAppendEntries(serverTo int, args *AppendEntriesArgs) {
 	if reply.Success {
 
 		rf.matchIndex[serverTo] = args.PrevLogIndex + len(args.Entries)
-		rf.nextIndex[serverTo] = rf.nextIndex[serverTo] + 1
+		rf.nextIndex[serverTo] = rf.matchIndex[serverTo] + 1
 
 		N := len(rf.log) - 1
 		for N > rf.commitIndex {
@@ -586,7 +586,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 
 	for i := 1; i < len(rf.peers); i++ {
-		rf.nextIndex[i] = 1
+		rf.nextIndex[i] = len(rf.log)
 	}
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
